@@ -1,5 +1,7 @@
 # typhoon-hil-nix
 
+[![ci](https://github.com/TheChaosBureau/typhoon-hil-nix/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/TheChaosBureau/typhoon-hil-nix/actions/workflows/ci.yml?query=branch%3Amain)
+
 Run [Typhoon HIL](https://www.typhoon-hil.com/) Control Center and Virtual HIL
 from a container: on a Linux workstation the vendor does not support (NixOS
 included), and on a self-hosted CI runner.
