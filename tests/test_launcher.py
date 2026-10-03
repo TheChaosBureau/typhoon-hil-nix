@@ -13,6 +13,7 @@ Nothing here needs podman, Typhoon or a license.
 from __future__ import annotations
 
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -28,7 +29,11 @@ EXTRACT_ICON = REPO_ROOT / "libexec" / "extract_icon.py"
 IMAGE = "typhoon-hil:2026.3"
 ARCHIVE = "typhoon-hil-2026.3.tar"
 
-STUB_PODMAN = r"""#!/usr/bin/env bash
+# Run every script through this bash by absolute path. A Nix build sandbox has
+# no /usr/bin/env, so nothing here may depend on an `env` shebang resolving.
+BASH = shutil.which("bash")
+
+STUB_PODMAN = r"""#!@BASH@
 # Record the call, one argument per line, then answer the few queries the
 # launcher makes. Behaviour is steered by STUB_* variables.
 { printf 'CALL\n'; printf '%s\n' "$@"; } >>"$STUB_LOG"
@@ -47,7 +52,7 @@ esac
 exit 0
 """
 
-STUB_FINDMNT = r"""#!/usr/bin/env bash
+STUB_FINDMNT = r"""#!@BASH@
 echo "${STUB_MOUNT_OPTIONS:-rw,relatime}"
 """
 
@@ -61,7 +66,7 @@ class Harness:
         self.bin.mkdir()
         for name, body in (("podman", STUB_PODMAN), ("findmnt", STUB_FINDMNT)):
             stub = self.bin / name
-            stub.write_text(body)
+            stub.write_text(body.replace("@BASH@", BASH))
             stub.chmod(0o755)
         self.state = self.home / ".local" / "share" / "typhoon-hil"
 
@@ -73,7 +78,7 @@ class Harness:
         }
         full_env.update(env)
         return subprocess.run(
-            [str(LAUNCHER), *args], cwd=cwd or self.home, env=full_env,
+            [BASH, str(LAUNCHER), *args], cwd=cwd or self.home, env=full_env,
             capture_output=True, text=True, timeout=60)
 
     def calls(self) -> list[list[str]]:
@@ -109,7 +114,7 @@ def option(call: list[str], name: str) -> str:
 # ---- workstation mode --------------------------------------------------------
 
 def test_help_needs_no_podman(tmp_path):
-    result = subprocess.run([str(LAUNCHER), "--help"], capture_output=True, text=True,
+    result = subprocess.run([BASH, str(LAUNCHER), "--help"], capture_output=True, text=True,
                             env={"PATH": os.environ["PATH"], "HOME": str(tmp_path)})
     assert result.returncode == 0, result.stderr
     assert "typhoon-hil run CMD" in result.stdout
