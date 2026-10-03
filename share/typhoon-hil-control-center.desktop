@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Typhoon HIL Control Center
+Comment=Schematic Editor, HIL SCADA and Virtual HIL, run from the typhoon-hil container
+Exec=typhoon-hil gui
+Icon=typhoon-hil-control-center
+Terminal=false
+Categories=Development;Engineering;Electronics;
+StartupNotify=true
+StartupWMClass=typhoon_hil.exe

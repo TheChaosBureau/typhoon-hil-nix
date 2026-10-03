@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+# typhoon-hil -- Typhoon HIL Control Center and Virtual HIL from a container.
+#
+#   typhoon-hil [gui]            Control Center on this desktop
+#   typhoon-hil run CMD...       run CMD in the current directory
+#   typhoon-hil shell            an interactive shell, same rules as `run`
+#   typhoon-hil smoke            Virtual HIL health check: compile, simulate, read
+#   typhoon-hil status           what is installed, licensed and running
+#   typhoon-hil stop             stop the workstation container
+#   typhoon-hil ci CMD...        run CMD the way a CI runner must: licenses from
+#                                read-only media, a throwaway home
+#   typhoon-hil build-image ...  build the image from the vendor's installer
+#   typhoon-hil check-image ...  verify an image or a saved archive
+#
+# `run` and `ci` take `--env NAME[=VALUE]` (repeatable) before the command.
+#
+# Why a container: Control Center ships as a vendor installer for Ubuntu. The
+# image runs that installer on Ubuntu, unmodified, so this works the same on a
+# distribution the vendor does not support. Nothing of Typhoon's is in this
+# tool: the installer and the licenses are the operator's own.
+#
+# Two ways to run it, because a workstation and a CI runner want opposite
+# things from the same image:
+#
+#   workstation (gui, run, shell, smoke)
+#     * HOME is a persistent host directory. A cold home rebuilds the solver
+#       and schematic-library caches before the first compile, which costs
+#       minutes.
+#     * Licenses live in that home, writable, placed once.
+#     * Project directories are mounted at their HOST paths, so a path printed
+#       by a test, saved in a model or typed into a file dialog means the same
+#       thing on both sides.
+#     * One container at a time, named $TYPHOON_HIL_NAME. Control Center is a
+#       single instance per home, so `run` and `shell` JOIN a container that is
+#       already up -- with Control Center open, an API script attaches to it,
+#       as it would on a native install -- and start a headless one otherwise.
+#
+#   ci
+#     * HOME is the image's throwaway one: every run starts cold and identical.
+#     * Licenses come from read-only media and are re-staged per run, so no job
+#       can alter the operator's files.
+#     * The image is loaded from a saved archive on every run, so a stale image
+#       in the runner's store can never stand in for the one that was verified.
+set -euo pipefail
+
+config="${XDG_CONFIG_HOME:-$HOME/.config}/typhoon-hil/config"
+# shellcheck disable=SC1090  # optional operator overrides, plain VAR=value lines
+[ ! -r "$config" ] || . "$config"
+
+if [ -z "${TYPHOON_HIL_ROOT:-}" ]; then
+    TYPHOON_HIL_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+fi
+export TYPHOON_HIL_ROOT
+# shellcheck source=lib/contract.sh
+. "$TYPHOON_HIL_ROOT/lib/contract.sh"
+
+: "${TYPHOON_HIL_NAME:=typhoon-hil}"
+: "${TYPHOON_HIL_STATE:=${XDG_DATA_HOME:-$HOME/.local/share}/typhoon-hil}"
+# Colon-separated directories mounted read-write at the same path inside.
+: "${TYPHOON_HIL_SHARE:=$HOME/Projects}"
+# Set to 0 to render in software (llvmpipe) instead of passing /dev/dri through.
+: "${TYPHOON_HIL_GPU:=1}"
+# Qt scale factor for the GUI, e.g. 1.5 on a HiDPI panel. Empty = Qt decides.
+: "${TYPHOON_HIL_SCALE:=}"
+
+cc_home="$TYPHOON_HIL_STATE/home"
+license_dir="$cc_home/$TYPHOON_LICENSE_SUBPATH"
+gui_log="$TYPHOON_HIL_STATE/control-center.log"
+icon_name=typhoon-hil-control-center
+
+say() { printf 'typhoon-hil: %s\n' "$*"; }
+die() {
+    printf 'typhoon-hil: %s\n' "$*" >&2
+    # Launched from the desktop there is no terminal to read that on.
+    if [ ! -t 2 ] && command -v notify-send >/dev/null 2>&1; then
+        notify-send --app-name='Typhoon HIL' 'Typhoon HIL did not start' "$*" || true
+    fi
+    exit 1
+}
+
+usage() { sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+container_state() {
+    podman container inspect --format '{{.State.Status}}' "$TYPHOON_HIL_NAME" 2>/dev/null || true
+}
+container_mode() {
+    podman container inspect --format '{{index .Config.Labels "typhoon-hil.mode"}}' \
+        "$TYPHOON_HIL_NAME" 2>/dev/null || true
+}
+
+require_image() {
+    podman image exists "$TYPHOON_IMAGE" || die "no $TYPHOON_IMAGE image in $(id -un)'s podman store.
+  Build it from the vendor's offline installer:
+    typhoon-hil build-image --installers <directory holding the *.gzip.run>"
+}
+
+# Is $1 inside a directory the container sees at the same path?
+shared_path() {
+    local p="$1" d
+    local -a shares
+    IFS=: read -r -a shares <<<"$TYPHOON_HIL_SHARE"
+    for d in "${shares[@]}"; do
+        [ -n "$d" ] || continue
+        case "$p/" in "$d"/*) return 0 ;; esac
+    done
+    return 1
+}
+
+# `--env NAME[=VALUE]` options ahead of a command. Leaves the options in
+# env_args and the number of words consumed in env_consumed.
+env_args=()
+env_consumed=0
+parse_env_options() {
+    env_args=()
+    env_consumed=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --env)
+                [ $# -ge 2 ] || die "--env needs NAME or NAME=VALUE"
+                env_args+=(--env "$2")
+                env_consumed=$((env_consumed + 2))
+                shift 2 ;;
+            --env=*)
+                env_args+=(--env "${1#--env=}")
+                env_consumed=$((env_consumed + 1))
+                shift ;;
+            --)
+                env_consumed=$((env_consumed + 1))
+                return 0 ;;
+            *) return 0 ;;
+        esac
+    done
+}
+
+# Arguments every workstation container gets: identity, the persistent home,
+# the shares, and this tool's helper scripts.
+base_args=()
+build_base_args() {
+    local mode="$1" d
+    local -a shares
+    mkdir -p "$cc_home" "$license_dir"
+    chmod 0700 "$TYPHOON_HIL_STATE" "$license_dir"
+    base_args=(
+        --rm --name "$TYPHOON_HIL_NAME" --label "typhoon-hil.mode=$mode"
+        # The container uid is the operator's, so files written into a share are
+        # the operator's and the home needs no chown.
+        --userns=keep-id
+        --env "HOME=$HOME"
+        --volume "$cc_home:$HOME:rw"
+        --volume "$TYPHOON_HIL_ROOT/libexec:$TYPHOON_TOOL_MOUNT:ro"
+        --env "TYPHOON_HIL_SMOKE=$TYPHOON_TOOL_MOUNT/smoke_test.py"
+    )
+    IFS=: read -r -a shares <<<"$TYPHOON_HIL_SHARE"
+    for d in "${shares[@]}"; do
+        [ -n "$d" ] || continue
+        [ -d "$d" ] || { say "skipping share $d (not a directory)"; continue; }
+        base_args+=(--volume "$d:$d:rw")
+    done
+}
+
+warn_unlicensed() {
+    local v missing=()
+    for v in 2 3; do
+        [ -s "$license_dir/instance_license_v$v.lic" ] || missing+=("instance_license_v$v.lic")
+    done
+    [ "${#missing[@]}" -eq 0 ] || say "no ${missing[*]} in $license_dir
+  Control Center opens and schematics render, but nothing compiles or simulates.
+  Copy license_v2.lic / license_v3.lic there under those names (mode 0600)."
+}
+
+# The desktop entry names an icon this tool cannot ship, because it is the
+# vendor's artwork. Pull it out of the image once. Best effort: without it the
+# launcher still works and merely shows a generic icon.
+install_icon() {
+    local icon="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/256x256/apps/$icon_name.png"
+    [ ! -s "$icon" ] || return 0
+    mkdir -p "$(dirname "$icon")" 2>/dev/null || return 0
+    if podman run --rm --entrypoint python3 \
+            --volume "$TYPHOON_HIL_ROOT/libexec:$TYPHOON_TOOL_MOUNT:ro" \
+            "$TYPHOON_IMAGE" "$TYPHOON_TOOL_MOUNT/extract_icon.py" >"$icon.tmp" 2>/dev/null \
+        && [ -s "$icon.tmp" ]; then
+        mv -f "$icon.tmp" "$icon"
+    else
+        rm -f "$icon.tmp"
+    fi
+}
+
+# ---- the desktop's X display ------------------------------------------------
+#
+# Control Center is given an X display and no Wayland socket, so its Qt picks
+# the xcb platform and reaches a Wayland session through XWayland: the socket
+# directory and the session's cookie file are all it needs. MIT-SHM is switched
+# off because the X server and the client are in different IPC namespaces; left
+# on, Qt attaches a segment the server cannot see.
+gui_args=()
+build_gui_args() {
+    local display="${DISPLAY:-}" xauth="${XAUTHORITY:-}"
+    if [ -z "$display" ]; then
+        # Not started from the session (ssh, a systemd unit): take its display.
+        local sock
+        sock="$(find /tmp/.X11-unix -maxdepth 1 -name 'X*' -user "$(id -u)" 2>/dev/null | sort | head -n1)"
+        [ -n "$sock" ] || die "no X display: DISPLAY is unset and /tmp/.X11-unix holds no socket of yours.
+  Start this from a logged-in desktop session."
+        display=":${sock##*/X}"
+    fi
+    if [ -z "$xauth" ]; then
+        # shellcheck disable=SC2012  # newest cookie file wins; names are ours
+        xauth="$(ls -1t "/run/user/$(id -u)"/.mutter-Xwaylandauth.* "$HOME/.Xauthority" 2>/dev/null | head -n1 || true)"
+    fi
+    [ -r "$xauth" ] || die "no readable X cookie file (XAUTHORITY='${XAUTHORITY:-}')"
+
+    gui_args=(
+        --env "DISPLAY=$display"
+        # Never let the entrypoint substitute a private Xvfb for a desktop it
+        # could not reach: Control Center would start, and be invisible.
+        --env TYPHOON_NO_XVFB=1
+        --env QT_X11_NO_MITSHM=1
+        --volume /tmp/.X11-unix:/tmp/.X11-unix:ro
+        --volume "$xauth:/run/host-xauthority:ro"
+        --env XAUTHORITY=/run/host-xauthority
+    )
+    [ -z "$TYPHOON_HIL_SCALE" ] || gui_args+=(--env "QT_SCALE_FACTOR=$TYPHOON_HIL_SCALE")
+    if [ "$TYPHOON_HIL_GPU" = 1 ] && [ -d /dev/dri ]; then
+        # keep-groups carries the operator's video/render membership in, which
+        # is what makes the device nodes openable under keep-id.
+        gui_args+=(--device /dev/dri --group-add keep-groups)
+    fi
+}
+
+cmd_gui() {
+    require_image
+    case "$(container_state)" in
+        running)
+            if [ "$(container_mode)" = gui ]; then
+                die "Control Center is already running (container $TYPHOON_HIL_NAME)"
+            fi
+            die "a headless \`typhoon-hil run\` is in progress in container $TYPHOON_HIL_NAME.
+  Wait for it, or \`typhoon-hil stop\`, then start Control Center." ;;
+    esac
+    install_icon
+    build_base_args gui
+    build_gui_args
+    warn_unlicensed
+    if [ ! -t 1 ]; then
+        exec >>"$gui_log" 2>&1
+        printf '\n==== %s ====\n' "$(date --iso-8601=seconds)"
+    fi
+    # shellcheck disable=SC2016  # expanded by the shell inside the container
+    exec podman run "${base_args[@]}" "${gui_args[@]}" --workdir "$HOME" \
+        "$TYPHOON_IMAGE" bash -c '
+            xdpyinfo >/dev/null 2>&1 || {
+                echo "typhoon-hil: cannot open display $DISPLAY from inside the container" >&2
+                exit 1
+            }
+            exec "$TYPHOONPATH/typhoon_hil.exe" "$@"' typhoon-hil "$@"
+}
+
+# `run`, `shell` and `smoke`: join the running container, or start a headless
+# one. $1 says whether the command works on the current directory.
+cmd_exec() {
+    local use_cwd="$1"
+    shift
+    require_image
+    parse_env_options "$@"
+    shift "$env_consumed"
+    [ $# -gt 0 ] || die "run needs a command, e.g. typhoon-hil run python3 -m pytest tests"
+
+    local -a tty=()
+    if [ -t 0 ] && [ -t 1 ]; then tty=(--interactive --tty); fi
+    local workdir="$PWD"
+    [ "$use_cwd" = 1 ] || workdir="$HOME"
+
+    if [ "$(container_state)" = running ]; then
+        if [ "$use_cwd" = 1 ] && ! shared_path "$PWD"; then
+            die "container $TYPHOON_HIL_NAME is running, and $PWD is not inside a shared directory
+  ($TYPHOON_HIL_SHARE), so it does not exist there.
+  Work from a shared directory, add this one to TYPHOON_HIL_SHARE in $config,
+  or \`typhoon-hil stop\` first."
+        fi
+        exec podman exec "${tty[@]}" "${env_args[@]}" --workdir "$workdir" "$TYPHOON_HIL_NAME" "$@"
+    fi
+
+    build_base_args headless
+    warn_unlicensed
+    if [ "$use_cwd" = 1 ] && ! shared_path "$PWD"; then
+        # Outside the shares: mount just this directory, at the image's workdir.
+        workdir="$TYPHOON_CONTAINER_WORKDIR"
+        base_args+=(--volume "$PWD:$TYPHOON_CONTAINER_WORKDIR:rw")
+    fi
+    exec podman run "${base_args[@]}" "${tty[@]}" "${env_args[@]}" --workdir "$workdir" \
+        "$TYPHOON_IMAGE" "$@"
+}
+
+# The CI entry point. Every prerequisite is checked before a container starts,
+# and each failure names the thing that is missing.
+cmd_ci() {
+    parse_env_options "$@"
+    shift "$env_consumed"
+    [ $# -gt 0 ] || die "ci needs a command, e.g. typhoon-hil ci -- python3 -m pytest tests"
+
+    local workdir="${GITHUB_WORKSPACE:-$PWD}"
+
+    local media_dir
+    media_dir="$(typhoon_resolve_media_dir)"
+    printf 'Using media directory %s\n' "$media_dir"
+    [ -d "$media_dir" ] || typhoon_die "$media_dir is not mounted (attach the license media)"
+    # READ-ONLY is the contract: a CI job must never be able to write to the
+    # operator's licenses.
+    typhoon_require_ro_mount "$media_dir"
+
+    local license_v2="${TYPHOON_LICENSE_V2:-$media_dir/license_v2.lic}"
+    local license_v3="${TYPHOON_LICENSE_V3:-$media_dir/license_v3.lic}"
+    [ -r "$license_v2" ] || typhoon_die "$license_v2 is not readable"
+    [ -r "$license_v3" ] || typhoon_die "$license_v3 is not readable"
+
+    # Archive resolution, in order: an explicit override, then the media, then
+    # the local stage. A miss names every location tried.
+    local image_tar="${TYPHOON_IMAGE_TAR:-}"
+    if [ -z "$image_tar" ]; then
+        if [ -r "$media_dir/$TYPHOON_IMAGE_TAR_NAME" ]; then
+            image_tar="$media_dir/$TYPHOON_IMAGE_TAR_NAME"
+        elif [ -r "$TYPHOON_LOCAL_ARCHIVE_DIR/$TYPHOON_IMAGE_TAR_NAME" ]; then
+            image_tar="$TYPHOON_LOCAL_ARCHIVE_DIR/$TYPHOON_IMAGE_TAR_NAME"
+            printf 'Archive not on %s; using local stage %s\n' "$media_dir" "$TYPHOON_LOCAL_ARCHIVE_DIR"
+        else
+            typhoon_die "no $TYPHOON_IMAGE_TAR_NAME on the media ($media_dir) or the local stage
+       ($TYPHOON_LOCAL_ARCHIVE_DIR). Build it with
+       \`typhoon-hil build-image --save <dir>\`, or set TYPHOON_IMAGE_TAR"
+        fi
+    fi
+    [ -r "$image_tar" ] || typhoon_die "TYPHOON_IMAGE_TAR=$image_tar is not readable"
+
+    # Reload on every run on purpose; see the header.
+    printf 'Loading %s from %s\n' "$TYPHOON_IMAGE" "$image_tar"
+    podman load --input "$image_tar"
+    podman image exists "$TYPHOON_IMAGE" || typhoon_die "archive did not provide image $TYPHOON_IMAGE
+       ($image_tar was built for a different tag; check TYPHOON_VERSION)"
+
+    typhoon_run_in_image "$TYPHOON_IMAGE" "$workdir" "$license_v2" "$license_v3" \
+        "${env_args[@]}" -- "$@"
+}
+
+cmd_status() {
+    local v state id
+    if podman image exists "$TYPHOON_IMAGE"; then
+        id="$(podman image inspect --format '{{.Id}}' "$TYPHOON_IMAGE")"
+        say "image     $TYPHOON_IMAGE (${id:0:12})"
+    else
+        say "image     $TYPHOON_IMAGE is NOT built"
+    fi
+    for v in 2 3; do
+        if [ -s "$license_dir/instance_license_v$v.lic" ]; then
+            say "license   instance_license_v$v.lic present"
+        else
+            say "license   instance_license_v$v.lic MISSING ($license_dir)"
+        fi
+    done
+    say "home      $cc_home"
+    say "shares    $TYPHOON_HIL_SHARE"
+    state="$(container_state)"
+    if [ -n "$state" ]; then
+        say "container $TYPHOON_HIL_NAME: $state ($(container_mode))"
+    else
+        say "container $TYPHOON_HIL_NAME: not running"
+    fi
+}
+
+sub="${1:-gui}"
+[ $# -eq 0 ] || shift
+case "$sub" in
+    -h|--help|help) usage; exit 0 ;;
+esac
+command -v podman >/dev/null || die "podman is not installed"
+case "$sub" in
+    gui) cmd_gui "$@" ;;
+    run) cmd_exec 1 "$@" ;;
+    shell) cmd_exec 1 bash ;;
+    smoke)
+        # A gate by default: exit non-zero unless the Virtual HIL layer passed.
+        cmd_exec 0 --env "TYPHOON_SMOKE_REQUIRE=${TYPHOON_SMOKE_REQUIRE:-L5}" \
+            --env "TYPHOON_SMOKE_TIMEOUT=${TYPHOON_SMOKE_TIMEOUT:-180}" -- \
+            "$TYPHOON_PYTHON" "$TYPHOON_TOOL_MOUNT/smoke_test.py" ;;
+    ci) cmd_ci "$@" ;;
+    status) cmd_status ;;
+    stop) podman stop --time 10 "$TYPHOON_HIL_NAME" ;;
+    build-image) exec "$TYPHOON_HIL_ROOT/libexec/build-image.sh" "$@" ;;
+    check-image) exec "$TYPHOON_HIL_ROOT/libexec/check-image.sh" "$@" ;;
+    *) usage >&2; exit 2 ;;
+esac
