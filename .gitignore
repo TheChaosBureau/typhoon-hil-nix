@@ -1,0 +1,8 @@
+result
+result-*
+__pycache__/
+.pytest_cache/
+# Never commit the vendor's installer or anyone's license.
+*.gzip.run
+*.lic
+*.tar

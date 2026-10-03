@@ -1,0 +1,277 @@
+# Typhoon HIL Control Center, built from the operator's offline installers.
+#
+# Built by `typhoon-hil build-image`, not by a bare `podman build`: the
+# 3.6 GB `*.gzip.run` installers are supplied through a *build-time bind
+# mount* (`podman build --volume "$dir:/installers:ro"`), never through the
+# build context. Copying them in would put a multi-gigabyte blob into a
+# layer that survives the `rm` in a later step, roughly doubling the archive.
+#
+# Consequences of that choice, on purpose:
+#   * this is a podman/buildah build (`--volume` at build time is theirs);
+#   * the build context stays a two-file temporary directory, which is what
+#     makes "no license in the build context" cheap to guarantee.
+#
+# Nothing license-shaped is baked in. Licenses arrive at *run* time as two
+# read-only bind mounts; see docs/image.md.
+
+ARG TYPHOON_BASE_IMAGE=ubuntu:24.04
+FROM ${TYPHOON_BASE_IMAGE}
+
+ARG TYPHOON_BASE_IMAGE=ubuntu:24.04
+ARG TYPHOON_VERSION=2026.3
+ARG TYPHOON_INSTALLER_MOUNT=/installers
+ARG TYPHOON_CC_INSTALLER_GLOB=typhoon_hil_control_center_v*.gzip.run
+ARG TYPHOON_SIM_INSTALLER_GLOB=typhoonsim_v*.gzip.run
+ARG TYPHOON_INSTALL_TYPHOONSIM=0
+ARG TYPHOON_CONTAINER_HOME=/tmp/typhoon-home
+ARG TYPHOON_LICENSE_SUBPATH=.local/share/typhoon/license
+ARG TYPHOON_CONTAINER_WORKDIR=/work
+ARG TYPHOON_BUILD_INFO_PATH=/opt/typhoon/image-build.json
+ARG TYPHOON_FORBIDDEN_LICENSE_NAMES="license_v2.lic license_v3.lic instance_license_v2.lic instance_license_v3.lic"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    PYTHONUNBUFFERED=1
+
+# Runtime dependencies of the Control Center Qt/X11 stack plus the headless
+# display it needs. Package names are the Ubuntu 24.04 (noble) ones -- the
+# t64 renames (libglib2.0-0t64, libasound2t64, libssl3t64, libcups2t64) are
+# not optional there.
+#
+# `build-essential` is NOT a build-time convenience -- it is a RUNTIME
+# dependency of Virtual HIL. Control Center compiles TyphoonSim's SUNDIALS
+# solver library (`libsp_lib_ar.a`, then the sim library and executable) the
+# first time it needs them, shelling out to a native cc/make. The install
+# bundles a prebuilt SUNDIALS but no native compiler, so without this the
+# startup logs read
+#   Unable to create sp_lib!   /   Unable to create simlib!
+# and every compile yields a Target files directory with no .cpd. Verified by
+# installing it into a running container and watching libsp_lib_ar.a appear.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        bash ca-certificates coreutils file findutils gzip locales procps tar \
+        python3 python3-pip python3-venv \
+        xvfb x11-utils \
+        libgl1 libglx-mesa0 libglu1-mesa libegl1 libopengl0 \
+        libx11-6 libx11-xcb1 libxext6 libxrender1 libxi6 libxtst6 \
+        libxrandr2 libxfixes3 libxcursor1 libxinerama1 libxcomposite1 libxdamage1 \
+        libxkbcommon0 libxkbcommon-x11-0 \
+        libxcb1 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+        libxcb-render0 libxcb-render-util0 libxcb-shape0 libxcb-shm0 \
+        libxcb-sync1 libxcb-xfixes0 libxcb-xinerama0 libxcb-xkb1 \
+        libxcb-util1 libxcb-cursor0 \
+        libfontconfig1 libfreetype6 libdbus-1-3 libnss3 libnspr4 \
+        libasound2t64 libpulse0 libsm6 libice6 libssl3t64 zlib1g \
+        libodbc2 libpq5 libcups2t64 \
+        build-essential; \
+    rm -rf /var/lib/apt/lists/*
+
+# ---- Control Center --------------------------------------------------------
+#
+# The invocation the vendor documents for a host install, minus sudo -- we
+# are already root here. `--noprogress` keeps the ~10 min install
+# from emitting a carriage-return progress bar into the build log.
+RUN set -eu; \
+    mount="$TYPHOON_INSTALLER_MOUNT"; \
+    [ -d "$mount" ] || { \
+        echo "build error: $mount is not mounted." >&2; \
+        echo "  Build through \`typhoon-hil build-image\`, which bind-mounts" >&2; \
+        echo "  the offline installer directory read-only at $mount." >&2; \
+        exit 1; }; \
+    installer="$(ls -1 "$mount"/$TYPHOON_CC_INSTALLER_GLOB 2>/dev/null | sort -V | tail -n1 || true)"; \
+    [ -n "$installer" ] || { \
+        echo "build error: no Control Center installer matching" >&2; \
+        echo "  $mount/$TYPHOON_CC_INSTALLER_GLOB" >&2; \
+        echo "  found: $(ls -1 "$mount" 2>/dev/null | tr '\n' ' ')" >&2; \
+        exit 1; }; \
+    case "$(basename "$installer")" in \
+        *"_v${TYPHOON_VERSION}"*) ;; \
+        *) echo "build error: installer $(basename "$installer") is not version ${TYPHOON_VERSION}." >&2; \
+           echo "  Refusing to build a ${TYPHOON_VERSION}-tagged image from it." >&2; \
+           exit 1 ;; \
+    esac; \
+    echo "installing $(basename "$installer")"; \
+    bash "$installer" --noprogress -- --accept_license_agreement; \
+    cc_dir="$(ls -1d /opt/typhoon/typhoon_hil_control_center_* 2>/dev/null | sort -V | tail -n1 || true)"; \
+    [ -n "$cc_dir" ] || { \
+        echo "build error: installer exited 0 but no /opt/typhoon/typhoon_hil_control_center_* exists." >&2; \
+        exit 1; }; \
+    ln -sfn "$cc_dir" /opt/typhoon/current; \
+    echo "TYPHOONPATH -> $cc_dir"
+
+# TYPHOONPATH points at the stable symlink so the value does not change with
+# a service-pack directory rename. smoke_test.py globs the real directory
+# name for the bundled 10_basic_model, which still resolves.
+ENV TYPHOONPATH=/opt/typhoon/current
+
+# ---- the two compilers a model compile actually shells out to --------------
+#
+# Compiling a schematic is not a pure-Python operation: it generates C and runs
+# `make`, twice over, for two different targets. Both failures look like a
+# broken model rather than a broken image, which is why they are called out here.
+#
+# 1. DEVICE FIRMWARE, cross-compiled. The example model targets
+#    `hil_device = "HIL402"`, whose code runs on a Xilinx Zynq ARM core, so
+#    `make` calls `arm-xilinx-eabi-gcc` by bare name and needs it on PATH. That
+#    cross-compiler **ships inside the Control Center install** at
+#    compilers/linux/z7/{arm,microblaze}/lin/bin; the image inherited the bare
+#    distro PATH, so it was unreachable. microblaze joins it for the SPC cores.
+#
+#    PATH alone is NOT sufficient, and the error does not distinguish the two
+#    causes -- see the 32-bit runtime layer below. Both this ENV and that layer
+#    are required; fixing either on its own still yields
+#      /bin/sh: 1: arm-xilinx-eabi-gcc: not found
+#      make: *** [src/subdir.mk:20: src/platform.o] Error 127
+#    with `compile()` returning False after writing a plausible
+#    `<model> Target files/` directory, minus the .cpd.
+#
+# 2. The NATIVE solver library, host-compiled -- see the build-essential note
+#    in the apt layer above. Control Center builds TyphoonSim's SUNDIALS
+#    solver on first use, and no native compiler is bundled (only a prebuilt
+#    SUNDIALS under compilers/linux/sundials).
+ENV PATH="/opt/typhoon/current/compilers/linux/z7/arm/lin/bin:/opt/typhoon/current/compilers/linux/z7/microblaze/lin/bin:${PATH}"
+
+# ---- 32-bit runtime, for the bundled cross-compiler ------------------------
+#
+# The Xilinx cross-compiler Control Center ships is **32-bit**: ELF class 1,
+# machine 3 (i386), Sourcery CodeBench Lite 2014.11-31 / gcc 4.9.1. It needs
+# /lib/ld-linux.so.2, and a 64-bit-only noble image has neither that loader nor
+# i386 as a dpkg architecture.
+#
+# This cost a full diagnostic round, because a missing ELF interpreter is
+# reported by the shell as though the file were absent:
+#   /bin/sh: 1: arm-xilinx-eabi-gcc: not found
+# which reads as a PATH problem and is not one. The tell: `command -v` SUCCEEDS
+# (it only tests existence and the executable bit) while executing the very same
+# path fails. If you are ever tempted to fix this with symlinks into
+# /usr/local/bin, check `readelf -h` first -- symlinks cannot supply a loader.
+RUN set -eux; \
+    dpkg --add-architecture i386; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        libc6:i386 zlib1g:i386 libstdc++6:i386; \
+    rm -rf /var/lib/apt/lists/*; \
+    test -e /lib/ld-linux.so.2; \
+    arm_gcc="$(ls -1 /opt/typhoon/*/compilers/linux/z7/arm/lin/bin/arm-xilinx-eabi-gcc 2>/dev/null | head -n1 || true)"; \
+    if [ -n "$arm_gcc" ]; then "$arm_gcc" --version >/dev/null; fi
+
+# ---- TyphoonSim (optional) -------------------------------------------------
+RUN set -eu; \
+    if [ "$TYPHOON_INSTALL_TYPHOONSIM" != "1" ]; then \
+        echo "skipping TyphoonSim (TYPHOON_INSTALL_TYPHOONSIM=$TYPHOON_INSTALL_TYPHOONSIM)"; \
+        exit 0; \
+    fi; \
+    installer="$(ls -1 "$TYPHOON_INSTALLER_MOUNT"/$TYPHOON_SIM_INSTALLER_GLOB 2>/dev/null | sort -V | tail -n1 || true)"; \
+    [ -n "$installer" ] || { \
+        echo "build error: TYPHOON_INSTALL_TYPHOONSIM=1 but no installer matching" >&2; \
+        echo "  $TYPHOON_INSTALLER_MOUNT/$TYPHOON_SIM_INSTALLER_GLOB" >&2; \
+        exit 1; }; \
+    case "$(basename "$installer")" in \
+        *"_v${TYPHOON_VERSION}"*) ;; \
+        *) echo "build error: $(basename "$installer") is not version ${TYPHOON_VERSION}." >&2; exit 1 ;; \
+    esac; \
+    before="$(ls -1d /opt/typhoon/* 2>/dev/null | sort || true)"; \
+    bash "$installer" --noprogress -- --accept_license_agreement; \
+    after="$(ls -1d /opt/typhoon/* 2>/dev/null | sort || true)"; \
+    [ "$before" != "$after" ] || { \
+        echo "build error: TyphoonSim installer exited 0 but /opt/typhoon is unchanged." >&2; \
+        exit 1; }
+
+# ---- Python API ------------------------------------------------------------
+#
+# The wheel that ships inside the install tree, not PyPI: PyPI lags the
+# released Control Center and a mismatched client silently fails at L2.
+# --break-system-packages is required on 24.04 (PEP 668); the image *is* the
+# environment, so there is nothing to protect it from.
+RUN set -eu; \
+    wheel="$(ls -1 "$TYPHOONPATH"/api_install/typhoon_hil_api-*-py3-none-any.whl 2>/dev/null | sort -V | tail -n1 || true)"; \
+    [ -n "$wheel" ] || { \
+        echo "build error: no typhoon_hil_api wheel under $TYPHOONPATH/api_install/" >&2; \
+        exit 1; }; \
+    python3 -m pip install --no-cache-dir --break-system-packages "$wheel"; \
+    python3 -c 'import typhoon.api'; \
+    python3 -c 'from importlib.metadata import version; print("Typhoon-HIL-API", version("Typhoon-HIL-API"))'
+
+# ---- HOME skeleton ---------------------------------------------------------
+#
+# Pre-created and world-writable on purpose. Under `--userns=keep-id` the
+# container uid is the runner's, and podman creates any *missing* parent of
+# a bind mount as root:root 0755 -- so if this tree did not already exist,
+# the license mount would silently leave $HOME unwritable and Control Center
+# would fail to start with an unrelated-looking error.
+RUN set -eux; \
+    mkdir -p "$TYPHOON_CONTAINER_HOME/$TYPHOON_LICENSE_SUBPATH" \
+             "$TYPHOON_CONTAINER_HOME/.config" \
+             "$TYPHOON_CONTAINER_HOME/.cache" \
+             "$TYPHOON_CONTAINER_HOME/.local/share/typhoon" \
+             "$TYPHOON_CONTAINER_WORKDIR"; \
+    chmod -R 0777 "$TYPHOON_CONTAINER_HOME" "$TYPHOON_CONTAINER_WORKDIR"
+
+# ---- the per-uid runtime directory -----------------------------------------
+#
+# Same trap as $HOME above, one directory over, and it is the one that kept
+# the first real build from ever starting Control Center.
+#
+# Control Center takes an exclusive lock at `/var/run/user/<uid>/config.lock`
+# when it starts, and it does NOT honour XDG_RUNTIME_DIR: pointing that at a
+# writable directory under $HOME changes nothing, the lock path stays
+# /var/run/user/<uid>. Without the directory the typhoon_hil binary dies with
+# "Failed to execute script", which the smoke test then reports as five
+# unrelated-looking layer timeouts.
+#
+# `/run` here is an image layer, not a runtime mount (verified: `findmnt /run`
+# reports no separate mount), so this chmod survives into the container. The
+# per-uid subdirectory itself cannot be created at build time -- under
+# `--userns=keep-id` the uid is only known at run time -- so `/run/user` ships
+# world-writable and the entrypoint makes `/run/user/$(id -u)` 0700.
+RUN set -eux; \
+    mkdir -p /run/user; \
+    chmod 0777 /run/user
+
+# ---- provenance + license guard -------------------------------------------
+#
+# The guard runs as the last build step so it sees everything the previous
+# steps produced. It fails on the operator's own license names anywhere in
+# the filesystem, and merely reports vendor `.lic` files shipped by Control
+# Center (blanket-failing on those would make a correct build unbuildable).
+RUN set -eu; \
+    cc_dir="$(readlink -f "$TYPHOONPATH")"; \
+    api_version="$(python3 -c 'from importlib.metadata import version; print(version("Typhoon-HIL-API"))')"; \
+    mkdir -p "$(dirname "$TYPHOON_BUILD_INFO_PATH")"; \
+    printf '{\n  "typhoon_version": "%s",\n  "control_center_path": "%s",\n  "typhoon_hil_api": "%s",\n  "base_image": "%s",\n  "typhoonsim_installed": %s,\n  "container_home": "%s",\n  "license_dir": "%s",\n  "built_utc": "%s"\n}\n' \
+        "$TYPHOON_VERSION" "$cc_dir" "$api_version" "$TYPHOON_BASE_IMAGE" \
+        "$([ "$TYPHOON_INSTALL_TYPHOONSIM" = 1 ] && echo true || echo false)" \
+        "$TYPHOON_CONTAINER_HOME" \
+        "$TYPHOON_CONTAINER_HOME/$TYPHOON_LICENSE_SUBPATH" \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        > "$TYPHOON_BUILD_INFO_PATH"; \
+    chmod 0444 "$TYPHOON_BUILD_INFO_PATH"; \
+    for name in $TYPHOON_FORBIDDEN_LICENSE_NAMES; do \
+        hits="$(find / -xdev -name "$name" -type f 2>/dev/null || true)"; \
+        if [ -n "$hits" ]; then \
+            echo "build error: operator license baked into the image:" >&2; \
+            echo "$hits" >&2; \
+            exit 1; \
+        fi; \
+    done; \
+    others="$(find / -xdev -name '*.lic' -type f 2>/dev/null || true)"; \
+    if [ -n "$others" ]; then \
+        echo "note: vendor .lic files present (allowed, not operator licenses):"; \
+        echo "$others"; \
+    fi; \
+    echo "license guard passed"
+
+COPY container-entrypoint.sh /usr/local/bin/typhoon-entrypoint
+RUN chmod 0755 /usr/local/bin/typhoon-entrypoint
+
+ENV HOME=${TYPHOON_CONTAINER_HOME} \
+    DISPLAY=:99
+
+WORKDIR ${TYPHOON_CONTAINER_WORKDIR}
+
+# `exec "$@"` in the entrypoint, so the CI call
+#   podman run ... typhoon-hil:2026.3 bash -euo pipefail -c '...' bash a b
+# reaches bash with its arguments intact.
+ENTRYPOINT ["/usr/local/bin/typhoon-entrypoint"]
+CMD ["bash"]

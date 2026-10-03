@@ -1,0 +1,17 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: flake check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      # shellcheck over every script, then the test suite. Neither needs podman,
+      # a Typhoon install or a license.
+      - run: nix flake check --print-build-logs
