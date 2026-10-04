@@ -171,6 +171,40 @@ host, because rootless podman depends on the host's own setup.
 [`docs/image.md`](docs/image.md) describes the image contract, what the checks
 catch, and the non-obvious things Control Center needs from a container.
 
+## Why a container, and not a Nix package
+
+Control Center *can* be packaged for Nix: `requireFile` for the installer,
+unpacked into the store, run under `buildFHSEnv`. The usual blocker for
+proprietary software does not even apply — Control Center never writes into its
+own install tree. Measured on 2026-10-04, running as a non-root uid against a
+root-owned install, a full compile plus a Virtual HIL simulation left it
+untouched; everything generated lands under
+`$HOME/.local/share/typhoon/THCC <version>/`. A read-only store install would
+work, and at ~7.7 GB it would be no larger than the image.
+
+It is still not what this repository does, for one reason: **Typhoon supports
+[Debian 13 and Ubuntu 24.04 LTS][sysreq], and nothing else.** A container can
+be exactly that; an FHS environment can only approximate it, and every
+approximation is yours to maintain across releases the vendor tests only on
+their own platforms.
+
+What that approximation would cost is not hypothetical. Getting the image green
+took six non-obvious fixes — a 32-bit loader for the bundled ARM
+cross-compiler, that compiler on `PATH`, a native toolchain for the solver
+library Control Center builds on first use, a per-uid runtime directory, a
+*writable* licence file, and a world-writable `$HOME` (see
+[docs/image.md](docs/image.md) §4). A Nix package needs every one of those facts
+re-discovered in a different form, plus Qt plugin loading and a 32-bit glibc
+inside the FHS environment. Upgrading, here, is re-running the vendor's own
+installer against a new release.
+
+The honest cost of this choice: the image is reproducible *by artifact* — a
+pinned archive and its sha256 — rather than by derivation, because the build
+runs `apt-get update`. Pinning an apt snapshot would close most of that gap
+without leaving the supported platform.
+
+[sysreq]: https://www.typhoon-hil.com/documentation/typhoon-hil-software-manual/concepts/system_requirements.html
+
 ## Development
 
 ```sh
