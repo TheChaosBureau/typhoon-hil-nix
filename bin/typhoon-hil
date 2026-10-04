@@ -5,6 +5,8 @@
 #   typhoon-hil run CMD...       run CMD in the current directory
 #   typhoon-hil shell            an interactive shell, same rules as `run`
 #   typhoon-hil smoke            Virtual HIL health check: compile, simulate, read
+#   typhoon-hil smoke-path       print that health check's path, to run it against
+#                                a NATIVE Control Center install instead
 #   typhoon-hil status           what is installed, licensed and running
 #   typhoon-hil stop             stop the workstation container
 #   typhoon-hil ci CMD...        run CMD the way a CI runner must: licenses from
@@ -78,7 +80,7 @@ die() {
     exit 1
 }
 
-usage() { sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 container_state() {
     podman container inspect --format '{{.State.Status}}' "$TYPHOON_HIL_NAME" 2>/dev/null || true
@@ -369,6 +371,13 @@ sub="${1:-gui}"
 [ $# -eq 0 ] || shift
 case "$sub" in
     -h|--help|help) usage; exit 0 ;;
+    # Prints a path and starts nothing, so it must work where podman does not:
+    # its caller is a NATIVE Control Center install running the same gate.
+    smoke-path)
+        smoke="$TYPHOON_HIL_ROOT/libexec/smoke_test.py"
+        [ -r "$smoke" ] || die "no smoke test at $smoke (broken installation)"
+        printf '%s\n' "$smoke"
+        exit 0 ;;
 esac
 command -v podman >/dev/null || die "podman is not installed"
 case "$sub" in

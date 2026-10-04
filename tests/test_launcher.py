@@ -13,6 +13,7 @@ Nothing here needs podman, Typhoon or a license.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -118,6 +119,38 @@ def test_help_needs_no_podman(tmp_path):
                             env={"PATH": os.environ["PATH"], "HOME": str(tmp_path)})
     assert result.returncode == 0, result.stderr
     assert "typhoon-hil run CMD" in result.stdout
+
+
+def test_help_lists_every_subcommand():
+    """The usage block is a fixed line range of this script's own header, so a
+    new subcommand is easy to add and easy to leave undocumented."""
+    text = LAUNCHER.read_text()
+    dispatch = text[text.index('sub="${1:-gui}"'):]
+    names = set()
+    for line in dispatch.splitlines():
+        match = re.match(r"\s{4}([a-z][a-z|-]*)\)", line)
+        if match:
+            names.update(match.group(1).split("|"))
+    names -= {"help"}
+    assert {"gui", "run", "ci", "smoke", "smoke-path"} <= names, names
+
+    result = subprocess.run([BASH, str(LAUNCHER), "--help"], capture_output=True, text=True,
+                            env={"PATH": os.environ["PATH"], "HOME": "/nonexistent"})
+    for name in sorted(names):
+        # `gui` is written as the default, `typhoon-hil [gui]`.
+        assert re.search(rf"typhoon-hil \[?{re.escape(name)}\]?\b", result.stdout), \
+            f"{name} is missing from --help"
+
+
+def test_smoke_path_prints_the_shipped_gate_and_starts_nothing(harness):
+    """A NATIVE Control Center install runs the same gate as the container, so
+    it has to be able to find it without a container being involved at all."""
+    result = harness.run("smoke-path")
+    assert result.returncode == 0, result.stderr
+    printed = Path(result.stdout.strip())
+    assert printed.is_file(), printed
+    assert "TYPHOON_SMOKE_REQUIRE" in printed.read_text(), "that is not the smoke test"
+    assert harness.calls() == [], "smoke-path must not invoke podman"
 
 
 def test_unbuilt_image_is_named_with_the_way_to_build_it(harness):

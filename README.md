@@ -64,6 +64,17 @@ typhoon-hil shell
 typhoon-hil status
 ```
 
+If Control Center is installed natively rather than in the container, run the
+same health check against it, so there is one gate and not two:
+
+```sh
+python3 "$(typhoon-hil smoke-path)"
+```
+
+Use the interpreter that carries the matching `typhoon-hil-api` wheel, and set
+`TYPHOON_SMOKE_REQUIRE=L5` to make it exit non-zero unless Virtual HIL ran.
+`smoke-path` starts no container and needs no podman.
+
 Things worth knowing:
 
 - **One container at a time.** If Control Center is open, `run` attaches to it,
