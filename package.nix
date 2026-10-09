@@ -13,7 +13,7 @@
 
 stdenvNoCC.mkDerivation {
   pname = "typhoon-hil";
-  version = "0.2.0";
+  version = "0.2.2";
 
   src = lib.fileset.toSource {
     root = ./.;
