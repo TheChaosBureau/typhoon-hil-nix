@@ -58,6 +58,7 @@ the merged filesystem, still shipped in the tar.
 | empty license directory | licenses baked instead of mounted |
 | display available | "Control Center down?" that is really a missing X server |
 | argv round-trip | an entrypoint that mangles the command it is given |
+| Schematic Editor (`-sc`) starts | a GUI stuck on "Working..." because the editor died on a missing library |
 | `TYPHOON_SMOKE_REQUIRE=L5` | a green CI check over a failed simulation |
 
 The smoke test is a diagnostic by default: it prints every layer's verdict and
@@ -144,6 +145,15 @@ and executing it fails. The image adds `libc6:i386`, `zlib1g:i386` and
 that want an X server. The entrypoint starts Xvfb unless a display is already
 reachable. The launcher's GUI mode sets `TYPHOON_NO_XVFB=1`, so a desktop that
 cannot be reached is an error rather than an invisible Control Center.
+
+**7. Libraries only the GUI loads.** The Schematic Editor runs as its own
+process, `typhoon_hil.exe -sc`. Its code editor loads the bundled `libgbm.so.1`,
+which links `libwayland-server.so.0` even on X11, so the image installs
+`libwayland-server0`. Without it the editor dies on import and Control Center
+shows "Working..." forever, ignoring Close. The container log says only `Failed
+to execute script 'typhoon_hil'`; the traceback is in `$HOME/.local/share/typhoon/
+THCC <version>/logs/errlog.txt`. No API path loads the editor, so the smoke test
+cannot catch this; `check-image` starts it.
 
 Two notes on the tooling itself:
 

@@ -13,8 +13,9 @@
 #
 # --image   checks the image: provenance file, Python API, TYPHOONPATH, the
 #           writable HOME skeleton, an empty license directory, no operator
-#           license in the merged filesystem, and that the entrypoint passes
-#           arguments through the way `typhoon-hil ci` calls it.
+#           license in the merged filesystem, that the entrypoint passes
+#           arguments through the way `typhoon-hil ci` calls it, and that the
+#           Schematic Editor gets past its imports (~30 s).
 # --archive checks the shipped artifact: every layer, for a license that was
 #           added and later deleted (invisible to --image, still in the tar).
 # --smoke   runs the real gate: the L5 Virtual HIL compile/load/start/read/
@@ -154,6 +155,37 @@ $probe_output"
         pass "no operator license in the merged filesystem"
     else
         fail "operator license present in the image: $(probe operator-licenses)"
+    fi
+
+    # The Schematic Editor is its own process, and its imports reach libraries
+    # the API never loads. One missing kills it at startup and leaves the GUI's
+    # "Working..." dialog up forever while every check above stays green. Start
+    # it and read Control Center's own error log: the PyInstaller stderr says
+    # only "Failed to execute script". Alone it later fails to find Control
+    # Center's message proxy; that is not an import error and does not count.
+    sc_output="$(podman run --rm \
+        --env "HOME=$TYPHOON_CONTAINER_HOME" \
+        "$image" \
+        bash -uo pipefail -c '
+            timeout "$1" "$TYPHOONPATH/typhoon_hil.exe" -sc >/dev/null 2>&1
+            printf "sc-exit=%s\n" "$?"
+            for log in "$HOME"/.local/share/typhoon/THCC\ */logs/errlog.txt; do
+                [ -r "$log" ] && sed "s/^/errlog: /" "$log"
+            done
+            true
+        ' bash 30 2>&1 || true)"
+    sc_exit="$(printf '%s\n' "$sc_output" | sed -n 's/^sc-exit=//p' | tail -n1)"
+    sc_import_error="$(printf '%s\n' "$sc_output" \
+        | grep -E '^errlog: .*(ImportError|ModuleNotFoundError|cannot open shared object file)' \
+        | tail -n1 || true)"
+    if [ -n "$sc_import_error" ]; then
+        fail "Schematic Editor (-sc) dies on import: ${sc_import_error#errlog: }"
+    elif [ "$sc_exit" = "124" ] || printf '%s\n' "$sc_output" | grep -q '^errlog: '; then
+        pass "Schematic Editor (-sc) starts past its imports"
+    else
+        fail "Schematic Editor (-sc) exited ${sc_exit:-?} without an errlog.txt
+        full container output:
+$sc_output"
     fi
 fi
 

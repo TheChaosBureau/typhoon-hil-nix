@@ -155,6 +155,24 @@ def test_containerfile_entrypoint_execs_arguments():
     assert 'exec "$@"' in (IMAGE_DIR / "container-entrypoint.sh").read_text()
 
 
+def test_containerfile_installs_the_schematic_editors_wayland_server():
+    """The bundled libgbm.so.1 links libwayland-server.so.0, even on X11.
+
+    Without it the Schematic Editor dies on import and the GUI waits on its
+    "Working..." dialog forever. No API path loads it, so only this and the
+    `-sc` start in check-image.sh would notice.
+    """
+    assert re.search(r"^\s+libwayland-server0\b", CONTAINERFILE.read_text(),
+                     re.MULTILINE)
+
+
+def test_check_image_starts_the_schematic_editor():
+    text = (LIBEXEC / "check-image.sh").read_text()
+    assert '"$TYPHOONPATH/typhoon_hil.exe" -sc' in text
+    assert "errlog.txt" in text, (
+        "the import traceback is only in Control Center's errlog.txt")
+
+
 def test_home_skeleton_is_world_writable():
     """`--userns=keep-id` means the container uid is unknown at build time."""
     text = CONTAINERFILE.read_text()
